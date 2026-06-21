@@ -292,22 +292,22 @@ class UserUpdate(BaseModel):
 # -----------------------------------------------------------------------------
 @api_router.post("/auth/register")
 async def register(payload: RegisterRequest, response: Response):
-    email = payload.email.lower()
-    exists = await db.users.find_one({"email": email})
-    if exists:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    user_id = str(uuid.uuid4())
-    # First user becomes admin automatically
+    """Bootstrap endpoint — only allowed when there are zero users in the DB.
+    After the first admin is created, new staff must be added by an existing
+    admin via POST /api/users."""
     user_count = await db.users.count_documents({})
-    role = "admin" if user_count == 0 else (payload.role or "cashier")
-    # Auto-create a store for new admin signups; otherwise put them in default store
-    if role == "admin":
-        store_doc = Store(name=f"{payload.name}'s Store", owner_id=user_id).model_dump()
-        await db.stores.insert_one(store_doc)
-        store_id = store_doc["id"]
-    else:
-        default = await db.stores.find_one({}, {"_id": 0})
-        store_id = default["id"] if default else ""
+    if user_count > 0:
+        raise HTTPException(
+            status_code=403,
+            detail="Public registration is disabled. Ask your administrator to create your account.",
+        )
+    email = payload.email.lower()
+    user_id = str(uuid.uuid4())
+    role = "admin"  # First user is always admin
+    # Auto-create a store for the new admin
+    store_doc = Store(name=f"{payload.name}'s Store", owner_id=user_id).model_dump()
+    await db.stores.insert_one(store_doc)
+    store_id = store_doc["id"]
     user_doc = {
         "id": user_id,
         "name": payload.name,
@@ -1091,6 +1091,153 @@ async def get_sale(sid: str, user: dict = Depends(get_current_user)):
     if not sale:
         raise HTTPException(status_code=404, detail="Sale not found")
     return sale
+
+
+@api_router.get("/sales/{sid}/pdf")
+async def get_sale_pdf(sid: str, user: dict = Depends(get_current_user)):
+    sale = await db.sales.find_one({"id": sid, "store_id": user["store_id"]}, {"_id": 0})
+    if not sale:
+        raise HTTPException(status_code=404, detail="Sale not found")
+    store = await db.stores.find_one({"id": user["store_id"]}, {"_id": 0}) or {}
+
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=18 * mm, rightMargin=18 * mm,
+        topMargin=18 * mm, bottomMargin=18 * mm,
+    )
+    styles = getSampleStyleSheet()
+    INDIGO = colors.HexColor("#2E4A7F")
+    INK = colors.HexColor("#1C1F26")
+    MUTED = colors.HexColor("#5C6370")
+    LINE = colors.HexColor("#E2DFD8")
+
+    body = ParagraphStyle("body", parent=styles["Normal"], fontSize=10, textColor=INK, leading=13)
+    bodyR = ParagraphStyle("bodyR", parent=body, alignment=2)  # right
+
+    flow = []
+
+    # Header block: Store + Invoice info
+    store_name = store.get("name", "KKP Stores")
+    store_lines = [store_name]
+    if store.get("address"):
+        store_lines.append(store["address"])
+    contact = []
+    if store.get("phone"):
+        contact.append("Phone: " + store["phone"])
+    if store.get("gstin"):
+        contact.append("GSTIN: " + store["gstin"])
+    if contact:
+        store_lines.append(" • ".join(contact))
+    left_html = (
+        f"<font color='#2E4A7F' size='18'><b>{store_name}</b></font><br/>"
+        + "<br/>".join(f"<font color='#5C6370' size='9'>{line}</font>" for line in store_lines[1:])
+    )
+    right_html = (
+        "<font color='#5C6370' size='9'>TAX INVOICE</font><br/>"
+        f"<font color='#1C1F26' size='14'><b>{sale['invoice_no']}</b></font><br/>"
+        f"<font color='#5C6370' size='9'>{datetime.fromisoformat(sale['created_at'].replace('Z','')).strftime('%d %b %Y, %H:%M') if 'T' in sale['created_at'] else sale['created_at']}</font>"
+    )
+    header_tbl = Table([[Paragraph(left_html, body), Paragraph(right_html, bodyR)]], colWidths=[100 * mm, 70 * mm])
+    header_tbl.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    flow.append(header_tbl)
+    flow.append(Spacer(1, 8 * mm))
+
+    # Bill To
+    bill_to_html = (
+        "<font color='#5C6370' size='8'>BILL TO</font><br/>"
+        f"<font color='#1C1F26' size='11'><b>{sale.get('customer_name', 'Walk-in Customer')}</b></font>"
+    )
+    payment_html = (
+        "<font color='#5C6370' size='8'>PAYMENT METHOD</font><br/>"
+        f"<font color='#1C1F26' size='11'><b>{sale.get('payment_method', 'cash').upper()}</b></font>"
+    )
+    bt = Table([[Paragraph(bill_to_html, body), Paragraph(payment_html, bodyR)]], colWidths=[100 * mm, 70 * mm])
+    bt.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    flow.append(bt)
+    flow.append(Spacer(1, 6 * mm))
+
+    # Items table
+    rupee = "\u20B9"
+    data = [["#", "Item", "Qty", "Rate", "GST%", "Total"]]
+    for idx, it in enumerate(sale.get("items", []), 1):
+        data.append([
+            str(idx),
+            it.get("name", ""),
+            f"{it.get('quantity', 0):g}",
+            f"{rupee}{it.get('unit_price', 0):.2f}",
+            f"{it.get('gst_percent', 0):g}%",
+            f"{rupee}{it.get('line_total', 0):.2f}",
+        ])
+    items_tbl = Table(data, colWidths=[10 * mm, 75 * mm, 18 * mm, 25 * mm, 17 * mm, 25 * mm])
+    items_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F3F1ED")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), MUTED),
+        ("FONTSIZE", (0, 0), (-1, 0), 8),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 1), (-1, -1), 9),
+        ("TEXTCOLOR", (0, 1), (-1, -1), INK),
+        ("ALIGN", (2, 0), (-1, -1), "RIGHT"),
+        ("ALIGN", (0, 0), (0, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.4, LINE),
+    ]))
+    flow.append(items_tbl)
+    flow.append(Spacer(1, 6 * mm))
+
+    # Totals (right-aligned block)
+    totals_rows = [
+        ["Subtotal", f"{rupee}{sale.get('subtotal', 0):.2f}"],
+        ["GST", f"{rupee}{sale.get('tax_total', 0):.2f}"],
+    ]
+    if sale.get("discount_total"):
+        totals_rows.append(["Discount", f"-{rupee}{sale['discount_total']:.2f}"])
+    totals_rows.append(["Grand Total", f"{rupee}{sale.get('grand_total', 0):.2f}"])
+    totals_tbl = Table(totals_rows, colWidths=[60 * mm, 30 * mm])
+    totals_tbl.setStyle(TableStyle([
+        ("FONTSIZE", (0, 0), (-1, -2), 10),
+        ("TEXTCOLOR", (0, 0), (-1, -2), MUTED),
+        ("FONTSIZE", (0, -1), (-1, -1), 13),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("TEXTCOLOR", (0, -1), (-1, -1), INDIGO),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("LINEABOVE", (0, -1), (-1, -1), 0.7, INDIGO),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    wrap = Table([["", totals_tbl]], colWidths=[80 * mm, 90 * mm])
+    wrap.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    flow.append(wrap)
+    flow.append(Spacer(1, 12 * mm))
+
+    # Footer note
+    flow.append(Paragraph(
+        f"<font color='#5C6370' size='8'>Generated on {datetime.now(timezone.utc).strftime('%d %b %Y, %H:%M UTC')} • This is a computer-generated invoice.</font>",
+        body,
+    ))
+    flow.append(Spacer(1, 2 * mm))
+    flow.append(Paragraph(
+        "<font color='#2E4A7F' size='9'><b>Thank you for shopping with us!</b></font>",
+        body,
+    ))
+
+    doc.build(flow)
+    buf.seek(0)
+    filename = f"{sale['invoice_no']}.pdf"
+    return StreamingResponse(
+        buf, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # -----------------------------------------------------------------------------
