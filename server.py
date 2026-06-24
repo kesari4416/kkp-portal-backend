@@ -524,7 +524,7 @@ CSV_COLUMNS = [
 
 
 @api_router.get("/products/export")
-async def export_products_csv(user: dict = Depends(get_current_user)):
+async def export_products_csv(user: dict = Depends(require_role("admin"))):
     products = await db.products.find({"store_id": user["store_id"]}, {"_id": 0}).sort("created_at", -1).to_list(5000)
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=CSV_COLUMNS, extrasaction="ignore")
@@ -541,7 +541,7 @@ async def export_products_csv(user: dict = Depends(get_current_user)):
 
 
 @api_router.get("/products/template")
-async def products_csv_template(user: dict = Depends(get_current_user)):
+async def products_csv_template(user: dict = Depends(require_role("admin"))):
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=CSV_COLUMNS)
     writer.writeheader()
@@ -692,7 +692,7 @@ async def update_product(pid: str, payload: ProductCreate, user: dict = Depends(
 
 
 @api_router.delete("/products/{pid}")
-async def delete_product(pid: str, user: dict = Depends(require_role("admin", "manager"))):
+async def delete_product(pid: str, user: dict = Depends(require_role("admin"))):
     res = await db.products.delete_one({"id": pid, "store_id": user["store_id"]})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -733,7 +733,7 @@ async def update_customer(cid: str, payload: CustomerCreate, user: dict = Depend
 
 
 @api_router.delete("/customers/{cid}")
-async def delete_customer(cid: str, user: dict = Depends(require_role("admin", "manager"))):
+async def delete_customer(cid: str, user: dict = Depends(require_role("admin"))):
     await db.customers.delete_one({"id": cid, "store_id": user["store_id"]})
     return {"message": "Deleted"}
 
@@ -767,7 +767,7 @@ CUSTOMER_CSV_COLUMNS = ["name", "phone", "email", "address", "gstin"]
 
 
 @api_router.get("/customers/export")
-async def export_customers_csv(user: dict = Depends(get_current_user)):
+async def export_customers_csv(user: dict = Depends(require_role("admin"))):
     items = await db.customers.find({"store_id": user["store_id"]}, {"_id": 0}).sort("created_at", -1).to_list(5000)
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=CUSTOMER_CSV_COLUMNS, extrasaction="ignore")
@@ -781,7 +781,7 @@ async def export_customers_csv(user: dict = Depends(get_current_user)):
 
 
 @api_router.get("/customers/template")
-async def customers_csv_template(user: dict = Depends(get_current_user)):
+async def customers_csv_template(user: dict = Depends(require_role("admin"))):
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=CUSTOMER_CSV_COLUMNS)
     w.writeheader()
@@ -896,7 +896,7 @@ async def update_supplier(sid: str, payload: SupplierCreate, user: dict = Depend
 
 
 @api_router.delete("/suppliers/{sid}")
-async def delete_supplier(sid: str, user: dict = Depends(require_role("admin", "manager"))):
+async def delete_supplier(sid: str, user: dict = Depends(require_role("admin"))):
     await db.suppliers.delete_one({"id": sid, "store_id": user["store_id"]})
     return {"message": "Deleted"}
 
@@ -908,7 +908,7 @@ SUPPLIER_CSV_COLUMNS = ["name", "contact_person", "phone", "email", "address", "
 
 
 @api_router.get("/suppliers/export")
-async def export_suppliers_csv(user: dict = Depends(get_current_user)):
+async def export_suppliers_csv(user: dict = Depends(require_role("admin"))):
     items = await db.suppliers.find({"store_id": user["store_id"]}, {"_id": 0}).sort("created_at", -1).to_list(5000)
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=SUPPLIER_CSV_COLUMNS, extrasaction="ignore")
@@ -922,7 +922,7 @@ async def export_suppliers_csv(user: dict = Depends(get_current_user)):
 
 
 @api_router.get("/suppliers/template")
-async def suppliers_csv_template(user: dict = Depends(get_current_user)):
+async def suppliers_csv_template(user: dict = Depends(require_role("admin"))):
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=SUPPLIER_CSV_COLUMNS)
     w.writeheader()
@@ -1344,6 +1344,33 @@ async def dashboard_summary(user: dict = Depends(get_current_user)):
         "chart_last_7_days": chart,
         "top_products": top_products,
         "low_stock_items": low_stock[:10],
+    }
+
+
+@api_router.get("/alerts/low-stock")
+async def low_stock_alerts(user: dict = Depends(get_current_user)):
+    """Return all products at or below their low-stock threshold for the active store."""
+    store_id = user["store_id"]
+    products = await db.products.find({"store_id": store_id}, {"_id": 0}).to_list(5000)
+    items = [
+        {
+            "id": p.get("id"),
+            "name": p.get("name"),
+            "sku": p.get("sku"),
+            "category": p.get("category"),
+            "unit": p.get("unit", "pcs"),
+            "stock_qty": p.get("stock_qty", 0),
+            "low_stock_threshold": p.get("low_stock_threshold", 0),
+            "out_of_stock": p.get("stock_qty", 0) <= 0,
+        }
+        for p in products
+        if p.get("stock_qty", 0) <= p.get("low_stock_threshold", 0)
+    ]
+    items.sort(key=lambda x: (not x["out_of_stock"], x["stock_qty"]))
+    return {
+        "count": len(items),
+        "out_of_stock_count": sum(1 for i in items if i["out_of_stock"]),
+        "items": items,
     }
 
 
